@@ -15,6 +15,11 @@ def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, s
         "quiet": True,
         "no_warnings": True,
         "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb"],
+            }
+        },
     }
 
     if COOKIES_FILE:
@@ -33,7 +38,11 @@ def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, s
             ydl_opts["default_search"] = "ytsearch1"
     elif mode == "youtube":
         ydl_opts.update({
-            "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
+            "format": (
+                f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={quality}]+bestaudio/"
+                f"best[height<={quality}]/best"
+            ),
             "merge_output_format": "mp4",
         })
     elif mode == "instagram":
