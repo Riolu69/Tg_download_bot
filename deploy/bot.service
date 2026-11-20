@@ -4,8 +4,8 @@ After=network.target telegram-bot-api.service
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/media-downloader-bot
-ExecStart=/opt/media-downloader-bot/venv/bin/python -m bot.main
+WorkingDirectory=/opt/Tg_download_bot
+ExecStart=/opt/Tg_download_bot/venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 
