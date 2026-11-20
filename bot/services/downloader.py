@@ -129,7 +129,7 @@ def download_media(
             "format": "best[ext=mp4]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
         })
-        if mode == "tiktok":
+        if mode in ("instagram", "tiktok"):
             ydl_opts["impersonate"] = ImpersonateTarget("chrome")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
