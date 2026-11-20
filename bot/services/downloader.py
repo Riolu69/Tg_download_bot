@@ -3,8 +3,8 @@ import yt_dlp
 from bot.config import COOKIES_FILE, DOWNLOAD_DIR, MAX_FILE_SIZE_MB
 
 
-def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, str]:
-    """Синхронно скачивает медиа и возвращает (путь_к_файлу, название)."""
+def download_media(query: str, mode: str, quality: str = "1080") -> dict:
+    """Синхронно скачивает медиа и возвращает словарь с путём и метаданными."""
     file_id = uuid.uuid4().hex
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
@@ -54,7 +54,6 @@ def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, s
         info = ydl.extract_info(query, download=True)
         if "entries" in info:
             info = info["entries"][0]
-        title = info.get("title", "media")
 
     downloaded_files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
     if not downloaded_files:
@@ -62,4 +61,10 @@ def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, s
             f"Файл не найден после загрузки (возможно, превышен лимит {MAX_FILE_SIZE_MB} МБ)."
         )
 
-    return str(downloaded_files[0]), title
+    return {
+        "path": str(downloaded_files[0]),
+        "title": info.get("title", "media"),
+        "width": info.get("width"),
+        "height": info.get("height"),
+        "duration": int(info["duration"]) if info.get("duration") else None,
+    }
