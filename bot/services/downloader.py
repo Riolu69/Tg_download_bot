@@ -3,13 +3,14 @@ import yt_dlp
 from bot.config import COOKIES_FILE, DOWNLOAD_DIR, MAX_FILE_SIZE_MB
 
 
-def download_media(query: str, mode: str) -> tuple[str, str]:
+def download_media(query: str, mode: str, quality: str = "1080") -> tuple[str, str]:
     """Синхронно скачивает медиа и возвращает (путь_к_файлу, название)."""
     file_id = uuid.uuid4().hex
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
     ydl_opts = {
         "outtmpl": outtmpl,
+        "source_address": "0.0.0.0",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -19,19 +20,20 @@ def download_media(query: str, mode: str) -> tuple[str, str]:
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    if mode == "music":
+    if mode == "music" or (mode == "youtube" and quality == "audio"):
         ydl_opts.update({
             "format": "bestaudio/best",
-            "default_search": "ytsearch1",
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
         })
+        if mode == "music":
+            ydl_opts["default_search"] = "ytsearch1"
     elif mode == "youtube":
         ydl_opts.update({
-            "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
             "merge_output_format": "mp4",
         })
     elif mode == "instagram":
