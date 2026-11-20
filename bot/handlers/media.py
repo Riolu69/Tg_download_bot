@@ -18,8 +18,13 @@ from bot.services.downloader import download_media, search_audio
 
 router = Router()
 
-YOUTUBE_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+")
+YOUTUBE_RE = re.compile(r"(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be)/.+")
 INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/.+")
+TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.|vt\.|m\.)?tiktok\.com/.+")
+VK_CLIP_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/clip-?\d+_\d+.*")
+VK_VIDEO_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/(video-?\d+_\d+|.*z=video-?\d+_\d+).*")
+
+SHORT_VIDEO_MODES = {"instagram", "tiktok", "vk_clip"}
 
 # Временное хранилище ссылок (callback_data ограничена 64 байтами)
 URL_CACHE: dict[str, str] = {}
@@ -43,19 +48,19 @@ def _format_duration(seconds: int | None) -> str:
     return f" ({mins}:{secs:02d})"
 
 
-def build_quality_keyboard(token: str) -> InlineKeyboardMarkup:
+def build_quality_keyboard(mode: str, token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 1080p", callback_data=f"yt:{token}:1080"),
-                InlineKeyboardButton(text="🎬 720p", callback_data=f"yt:{token}:720"),
+                InlineKeyboardButton(text="🎬 1080p", callback_data=f"q:{mode}:{token}:1080"),
+                InlineKeyboardButton(text="🎬 720p", callback_data=f"q:{mode}:{token}:720"),
             ],
             [
-                InlineKeyboardButton(text="🎬 480p", callback_data=f"yt:{token}:480"),
-                InlineKeyboardButton(text="🎬 360p", callback_data=f"yt:{token}:360"),
+                InlineKeyboardButton(text="🎬 480p", callback_data=f"q:{mode}:{token}:480"),
+                InlineKeyboardButton(text="🎬 360p", callback_data=f"q:{mode}:{token}:360"),
             ],
             [
-                InlineKeyboardButton(text="🎵 Только аудио (MP3)", callback_data=f"yt:{token}:audio"),
+                InlineKeyboardButton(text="🎵 Только аудио (MP3)", callback_data=f"q:{mode}:{token}:audio"),
             ],
         ]
     )
@@ -112,7 +117,7 @@ async def _download_and_send(
         media = FSInputFile(file_path, filename=safe_name)
         thumb = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
 
-        if mode == "music" or (mode == "youtube" and quality == "audio"):
+        if mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio"):
             await target_msg.answer_audio(
                 audio=media,
                 title=title,
@@ -122,7 +127,7 @@ async def _download_and_send(
         else:
             await target_msg.answer_video(
                 video=media,
-                caption=None if mode == "instagram" else title[:200],
+                caption=None if mode in SHORT_VIDEO_MODES else title[:200],
                 width=meta.get("width"),
                 height=meta.get("height"),
                 duration=meta.get("duration"),
@@ -149,15 +154,34 @@ async def handle_text(message: Message):
         token = _cache_url(text)
         await message.answer(
             "Выберите качество загрузки:",
-            reply_markup=build_quality_keyboard(token),
+            reply_markup=build_quality_keyboard("youtube", token),
+        )
+        return
+
+    if VK_VIDEO_RE.match(text):
+        token = _cache_url(text)
+        await message.answer(
+            "Выберите качество загрузки (VK Видео):",
+            reply_markup=build_quality_keyboard("vk_video", token),
         )
         return
 
     if INSTAGRAM_RE.match(text):
-        status_msg = await message.answer("Скачиваю из Instagram...")
-        await _download_and_send(
-            message, status_msg, text, "instagram", header="Скачиваю из Instagram..."
-        )
+        header = "Скачиваю из Instagram..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "instagram", header=header)
+        return
+
+    if TIKTOK_RE.match(text):
+        header = "Скачиваю из TikTok..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "tiktok", header=header)
+        return
+
+    if VK_CLIP_RE.match(text):
+        header = "Скачиваю VK Клип..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "vk_clip", header=header)
         return
 
     # Поиск музыки с выбором трека
@@ -178,11 +202,11 @@ async def handle_text(message: Message):
     )
 
 
-@router.callback_query(F.data.startswith("yt:"))
-async def handle_youtube_quality(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("q:"))
+async def handle_video_quality(callback: CallbackQuery):
     await callback.answer()
 
-    _, token, quality = callback.data.split(":", maxsplit=2)
+    _, mode, token, quality = callback.data.split(":", maxsplit=3)
     url = URL_CACHE.get(token)
 
     if not url:
@@ -194,7 +218,7 @@ async def handle_youtube_quality(callback: CallbackQuery):
     await callback.message.edit_text(header, reply_markup=None)
 
     await _download_and_send(
-        callback.message, callback.message, url, "youtube", quality, header=header
+        callback.message, callback.message, url, mode, quality, header=header
     )
 
 
