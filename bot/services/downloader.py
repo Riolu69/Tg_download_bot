@@ -105,7 +105,7 @@ def download_media(
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
-    if mode == "music" or (mode == "youtube" and quality == "audio"):
+    if mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio"):
         ydl_opts["format"] = "bestaudio/best"
         ydl_opts["postprocessors"].insert(0, {
             "key": "FFmpegExtractAudio",
@@ -114,7 +114,7 @@ def download_media(
         })
         if mode == "music" and not query.startswith("http"):
             ydl_opts["default_search"] = "ytsearch1"
-    elif mode == "youtube":
+    elif mode in ("youtube", "vk_video"):
         ydl_opts.update({
             "format": (
                 f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
@@ -123,8 +123,11 @@ def download_media(
             ),
             "merge_output_format": "mp4",
         })
-    elif mode == "instagram":
-        ydl_opts["format"] = "best[ext=mp4]/best"
+    elif mode in ("instagram", "tiktok", "vk_clip"):
+        ydl_opts.update({
+            "format": "best[ext=mp4]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+        })
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=True)
