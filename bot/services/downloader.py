@@ -3,6 +3,7 @@ import uuid
 from typing import Callable
 
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from bot.config import COOKIES_FILE, DOWNLOAD_DIR, MAX_FILE_SIZE_MB
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -128,6 +129,8 @@ def download_media(
             "format": "best[ext=mp4]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
         })
+        if mode == "tiktok":
+            ydl_opts["impersonate"] = ImpersonateTarget("chrome")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=True)
