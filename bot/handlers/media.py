@@ -51,14 +51,27 @@ async def _download_and_send(
 ):
     file_path = None
     try:
-        file_path, title = await asyncio.to_thread(download_media, query, mode, quality)
+        meta = await asyncio.to_thread(download_media, query, mode, quality)
+        file_path = meta["path"]
+        title = meta["title"]
         safe_name = f"{title[:50]}{Path(file_path).suffix}"
         media = FSInputFile(file_path, filename=safe_name)
 
         if mode == "music" or (mode == "youtube" and quality == "audio"):
-            await target_msg.answer_audio(audio=media, title=title)
+            await target_msg.answer_audio(
+                audio=media,
+                title=title,
+                duration=meta.get("duration"),
+            )
         else:
-            await target_msg.answer_video(video=media, caption=title[:200])
+            await target_msg.answer_video(
+                video=media,
+                caption=title[:200],
+                width=meta.get("width"),
+                height=meta.get("height"),
+                duration=meta.get("duration"),
+                supports_streaming=True,
+            )
 
         await status_msg.delete()
 
