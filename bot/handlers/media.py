@@ -122,7 +122,7 @@ async def _download_and_send(
         else:
             await target_msg.answer_video(
                 video=media,
-                caption=title[:200],
+                caption=None if mode == "instagram" else title[:200],
                 width=meta.get("width"),
                 height=meta.get("height"),
                 duration=meta.get("duration"),
