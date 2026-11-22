@@ -160,10 +160,18 @@ async def _download_and_send(
             "⚠️ Не удалось загрузить файл\nСсылка неверная, файл не найден или сервис временно недоступен.",
         )
 
-    finally:
+   finally:
+        cleaned_dirs: set[Path] = set()
         for path in (file_path, thumb_path, *photo_paths):
-            if path and os.path.exists(path):
-                os.remove(path)
+            if not path:
+                continue
+            p = Path(path)
+            if p.parent.name.endswith("_gdl") and p.parent.exists():
+                cleaned_dirs.add(p.parent)
+            elif p.exists():
+                p.unlink(missing_ok=True)
+        for d in cleaned_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 @router.message(F.text)
