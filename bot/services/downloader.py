@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import time
 import urllib.request
 import uuid
@@ -103,67 +106,35 @@ def _download_image_file(
         return None
 
 
-def _collect_image_urls(obj: object, out: list[str], seen: set[str]):
-    """Рекурсивно собирает URL картинок из метаданных yt-dlp (включая карусели)."""
-    if isinstance(obj, dict):
-        if obj.get("vcodec") and obj.get("vcodec") != "none":
-            return
+def _download_via_gallery_dl(url: str, file_id: str, cookiefile: str | None = None) -> list[str]:
+    """Скачивает фото/карусель через gallery-dl и возвращает список путей к файлам."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "gallery_dl",
+        "--no-mtime",
+        "--filename",
+        f"{file_id}_{{num:02d}}.{{extension}}",
+        "-d",
+        str(DOWNLOAD_DIR),
+    ]
+    if cookiefile and os.path.isfile(cookiefile):
+        cmd.extend(["--cookies", cookiefile])
+    cmd.append(url)
 
-        for key in ("url", "display_url"):
-            val = obj.get(key)
-            if isinstance(val, str) and val.startswith("http"):
-                ext = Path(val.split("?")[0]).suffix.lower()
-                if ext in IMAGE_EXTS and val not in seen:
-                    seen.add(val)
-                    out.append(val)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception:
+        return []
 
-        thumbs = obj.get("thumbnails")
-        if isinstance(thumbs, list) and thumbs:
-            best_thumb = max(
-                (t for t in thumbs if isinstance(t, dict) and t.get("url")),
-                key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
-                default=None,
-            )
-            if best_thumb:
-                t_url = best_thumb["url"]
-                if t_url not in seen:
-                    seen.add(t_url)
-                    out.append(t_url)
+    if proc.returncode != 0:
+        return []
 
-        for key in ("entries", "carousel_media", "items"):
-            child = obj.get(key)
-            if isinstance(child, list):
-                for item in child:
-                    _collect_image_urls(item, out, seen)
-    elif isinstance(obj, list):
-        for item in obj:
-            _collect_image_urls(item, out, seen)
-
-
-def _extract_images_from_info(
-    info: dict,
-    file_id: str,
-    impersonate: bool = False,
-    cookiefile: str | None = None,
-) -> list[str]:
-    """Скачивает найденные изображения из метаданных поста/карусели."""
-    urls: list[str] = []
-    seen: set[str] = set()
-    _collect_image_urls(info, urls, seen)
-
-    saved_paths: list[str] = []
-    for idx, img_url in enumerate(urls[:10]):
-        stem = f"{file_id}_img_{idx}"
-        path = _download_image_file(
-            img_url,
-            stem,
-            impersonate=impersonate,
-            cookiefile=cookiefile,
-        )
-        if path and path.exists() and path.stat().st_size > 0:
-            saved_paths.append(str(path))
-
-    return saved_paths
+    matched = sorted(
+        f for f in DOWNLOAD_DIR.glob(f"{file_id}_*")
+        if f.is_file() and f.stat().st_size > 0
+    )
+    return [str(p) for p in matched[:10]]
 
 
 def search_audio(query: str, limit: int = 5) -> list[dict]:
@@ -297,33 +268,17 @@ def download_media(
             )
     except yt_dlp.utils.DownloadError as err:
         msg = str(err)
-        if "No video formats found" in msg and mode in ("instagram", "twitter"):
-            try:
-                meta_opts = {
-                    k: v
-                    for k, v in ydl_opts.items()
-                    if k not in ("format", "merge_output_format", "progress_hooks")
+        if mode in ("instagram", "twitter") and ("No video formats found" in msg or "gallery" in msg.lower()):
+            photos = _download_via_gallery_dl(query, file_id, cookiefile=active_cookies)
+            if photos:
+                return {
+                    "type": "photos",
+                    "paths": photos,
+                    "title": "Фото",
                 }
-                meta_opts["writethumbnail"] = False
-                with yt_dlp.YoutubeDL(meta_opts) as ydl:
-                    raw_info = ydl.extract_info(query, download=False) or {}
-                photos = _extract_images_from_info(
-                    raw_info,
-                    file_id,
-                    impersonate=use_impersonate,
-                    cookiefile=active_cookies,
-                )
-                if photos:
-                    return {
-                        "type": "photos",
-                        "paths": photos,
-                        "title": raw_info.get("title") or "Фото",
-                    }
-            except Exception:
-                pass
             raise MediaNotFoundError(
                 "По этой ссылке не найдено видео (похоже на пост с фото/карусель). "
-                "Не удалось извлечь фото — проверьте куки Instagram или доступность поста."
+                "Не удалось скачать фото — проверьте куки Instagram или доступность поста."
             ) from err
 
         if any(k in msg for k in ("HTTP Error 404", "Not Found", "Private video", "unavailable")):
@@ -340,14 +295,9 @@ def download_media(
     thumb_files = [f for f in all_files if f.suffix.lower() == ".jpg"]
 
     if not media_files and mode in ("instagram", "twitter"):
-        photos = _extract_images_from_info(
-            info,
-            file_id,
-            impersonate=use_impersonate,
-            cookiefile=active_cookies,
-        )
         for f in thumb_files:
             f.unlink(missing_ok=True)
+        photos = _download_via_gallery_dl(query, file_id, cookiefile=active_cookies)
         if photos:
             return {
                 "type": "photos",
