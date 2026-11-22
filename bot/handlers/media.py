@@ -11,10 +11,11 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
-from bot.services.downloader import download_media, search_audio
+from bot.services.downloader import MediaNotFoundError, download_media, search_audio
 
 router = Router()
 
@@ -96,8 +97,9 @@ async def _download_and_send(
     quality: str = "1080",
     header: str = "Скачиваю...",
 ):
-    file_path = None
-    thumb_path = None
+    file_path: str | None = None
+    thumb_path: str | None = None
+    photo_paths: list[str] = []
     loop = asyncio.get_running_loop()
 
     def on_progress(progress_text: str):
@@ -108,41 +110,58 @@ async def _download_and_send(
 
     try:
         meta = await asyncio.to_thread(download_media, query, mode, quality, on_progress)
-        file_path = meta["path"]
-        thumb_path = meta.get("thumb")
+        media_type = meta.get("type", "video")
         title = meta["title"]
 
         await _safe_edit(status_msg, f"{header}\nОтправляю в Telegram...")
 
-        safe_name = f"{title[:50]}{Path(file_path).suffix}"
-        media = FSInputFile(file_path, filename=safe_name)
-        thumb = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
-
-        if mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio"):
-            await target_msg.answer_audio(
-                audio=media,
-                title=title,
-                duration=meta.get("duration"),
-                thumbnail=thumb,
-            )
+        if media_type == "photos":
+            photo_paths = meta.get("paths") or []
+            if len(photo_paths) == 1:
+                await target_msg.answer_photo(photo=FSInputFile(photo_paths[0]))
+            elif photo_paths:
+                group = [InputMediaPhoto(media=FSInputFile(p)) for p in photo_paths[:10]]
+                await target_msg.answer_media_group(media=group)
         else:
-            await target_msg.answer_video(
-                video=media,
-                caption=None if mode in SHORT_VIDEO_MODES else title[:200],
-                width=meta.get("width"),
-                height=meta.get("height"),
-                duration=meta.get("duration"),
-                thumbnail=thumb,
-                supports_streaming=True,
-            )
+            file_path = meta["path"]
+            thumb_path = meta.get("thumb")
+            safe_name = f"{title[:50]}{Path(file_path).suffix}"
+            media = FSInputFile(file_path, filename=safe_name)
+            thumb = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
+
+            if media_type == "audio":
+                await target_msg.answer_audio(
+                    audio=media,
+                    title=title,
+                    duration=meta.get("duration"),
+                    thumbnail=thumb,
+                )
+            else:
+                await target_msg.answer_video(
+                    video=media,
+                    caption=None if mode in SHORT_VIDEO_MODES else title[:200],
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    duration=meta.get("duration"),
+                    thumbnail=thumb,
+                    supports_streaming=True,
+                )
 
         await status_msg.delete()
 
-    except Exception as e:
-        await _safe_edit(status_msg, f"Ошибка загрузки: {e}")
+    except MediaNotFoundError as e:
+        await _safe_edit(
+            status_msg,
+            f"⚠️ <b>Медиа не найдено</b>\n{e}",
+        )
+    except Exception:
+        await _safe_edit(
+            status_msg,
+            "⚠️ <b>Не удалось загрузить файл</b>\nСсылка неверная, файл не найден или сервис временно недоступен.",
+        )
 
     finally:
-        for path in (file_path, thumb_path):
+        for path in (file_path, thumb_path, *photo_paths):
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -195,8 +214,8 @@ async def handle_text(message: Message):
     status_msg = await message.answer(f"Ищу треки по запросу «{text}»...")
     try:
         tracks = await asyncio.to_thread(search_audio, text, 5)
-    except Exception as e:
-        await _safe_edit(status_msg, f"Ошибка поиска: {e}")
+    except Exception:
+        await _safe_edit(status_msg, "⚠️ Не удалось выполнить поиск. Попробуйте позже.")
         return
 
     if not tracks:
