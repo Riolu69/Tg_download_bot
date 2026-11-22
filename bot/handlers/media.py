@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -160,7 +161,7 @@ async def _download_and_send(
             "⚠️ Не удалось загрузить файл\nСсылка неверная, файл не найден или сервис временно недоступен.",
         )
 
-   finally:
+    finally:
         cleaned_dirs: set[Path] = set()
         for path in (file_path, thumb_path, *photo_paths):
             if not path:
