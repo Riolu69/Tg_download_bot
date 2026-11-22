@@ -16,7 +16,12 @@ from aiogram.types import (
     Message,
 )
 
-from bot.services.downloader import MediaNotFoundError, download_media, search_audio
+from bot.services.downloader import (
+    MediaNotFoundError,
+    download_media,
+    get_video_size_hints,
+    search_audio,
+)
 
 router = Router()
 
@@ -51,19 +56,45 @@ def _format_duration(seconds: int | None) -> str:
     return f" ({mins}:{secs:02d})"
 
 
-def build_quality_keyboard(mode: str, token: str) -> InlineKeyboardMarkup:
+def _label_with_size(base_label: str, size_hint: str | None) -> str:
+    if not size_hint:
+        return base_label
+    return f"{base_label} ({size_hint})"
+
+
+def build_quality_keyboard(
+    mode: str,
+    token: str,
+    size_hints: dict[str, str] | None = None,
+) -> InlineKeyboardMarkup:
+    hints = size_hints or {}
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🎬 1080p", callback_data=f"q:{mode}:{token}:1080"),
-                InlineKeyboardButton(text="🎬 720p", callback_data=f"q:{mode}:{token}:720"),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 1080p", hints.get("1080")),
+                    callback_data=f"q:{mode}:{token}:1080",
+                ),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 720p", hints.get("720")),
+                    callback_data=f"q:{mode}:{token}:720",
+                ),
             ],
             [
-                InlineKeyboardButton(text="🎬 480p", callback_data=f"q:{mode}:{token}:480"),
-                InlineKeyboardButton(text="🎬 360p", callback_data=f"q:{mode}:{token}:360"),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 480p", hints.get("480")),
+                    callback_data=f"q:{mode}:{token}:480",
+                ),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 360p", hints.get("360")),
+                    callback_data=f"q:{mode}:{token}:360",
+                ),
             ],
             [
-                InlineKeyboardButton(text="🎵 Только аудио (MP3)", callback_data=f"q:{mode}:{token}:audio"),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎵 Только аудио (MP3)", hints.get("audio")),
+                    callback_data=f"q:{mode}:{token}:audio",
+                ),
             ],
         ]
     )
@@ -181,9 +212,11 @@ async def handle_text(message: Message):
 
     if YOUTUBE_RE.match(text):
         token = _cache_url(text)
-        await message.answer(
+        wait_msg = await message.answer("Проверяю доступные качества и размер...")
+        size_hints = await asyncio.to_thread(get_video_size_hints, text, "youtube")
+        await wait_msg.edit_text(
             "Выберите качество загрузки:",
-            reply_markup=build_quality_keyboard("youtube", token),
+            reply_markup=build_quality_keyboard("youtube", token, size_hints),
         )
         return
 
