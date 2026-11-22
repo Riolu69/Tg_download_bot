@@ -124,7 +124,7 @@ def download_media(
             ),
             "merge_output_format": "mp4",
         })
-    elif mode in ("instagram", "tiktok", "vk_clip"):
+    elif mode in ("instagram", "tiktok", "vk_clip", "twitter"):
         ydl_opts.update({
             "format": "best[ext=mp4]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
