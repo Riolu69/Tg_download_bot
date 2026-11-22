@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -107,33 +108,36 @@ def _download_image_file(
 
 
 def _download_via_gallery_dl(url: str, file_id: str, cookiefile: str | None = None) -> list[str]:
-    """Скачивает фото/карусель через gallery-dl и возвращает список путей к файлам."""
+    """Скачивает фото/карусель через gallery-dl во временную папку и возвращает список путей."""
+    temp_dir = DOWNLOAD_DIR / f"{file_id}_gdl"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     cmd = [
         sys.executable,
         "-m",
         "gallery_dl",
         "--no-mtime",
-        "--filename",
-        f"{file_id}_{{num:02d}}.{{extension}}",
         "-d",
-        str(DOWNLOAD_DIR),
+        str(temp_dir),
     ]
     if cookiefile and os.path.isfile(cookiefile):
         cmd.extend(["--cookies", cookiefile])
     cmd.append(url)
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except Exception:
-        return []
-
-    if proc.returncode != 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
         return []
 
     matched = sorted(
-        f for f in DOWNLOAD_DIR.glob(f"{file_id}_*")
+        f for f in temp_dir.rglob("*")
         if f.is_file() and f.stat().st_size > 0
     )
+    if not matched:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return []
+
     return [str(p) for p in matched[:10]]
 
 
