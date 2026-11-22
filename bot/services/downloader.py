@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from typing import Callable
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from bot.config import COOKIES_FILE, DOWNLOAD_DIR, IG_COOKIES_FILE, MAX_FILE_SIZE_MB
+
+logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -53,7 +56,8 @@ def _cookie_header_from_file(cookiefile: str | None) -> str | None:
                     name, value = parts[5], parts[6]
                     if name:
                         pairs.append(f"{name}={value}")
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to parse cookies from %s: %s", cookiefile, exc)
         return None
     return "; ".join(pairs) if pairs else None
 
@@ -103,7 +107,8 @@ def _download_image_file(
             out_path = DOWNLOAD_DIR / f"{dest_stem}{ext}"
             out_path.write_bytes(data)
             return out_path
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to download image %s: %s", url, exc)
         return None
 
 
@@ -125,8 +130,16 @@ def _download_via_gallery_dl(url: str, file_id: str, cookiefile: str | None = No
     cmd.append(url)
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except Exception:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            logger.warning(
+                "gallery-dl exited with code %s for %s: %s",
+                proc.returncode,
+                url,
+                (proc.stderr or proc.stdout or "").strip(),
+            )
+    except Exception as exc:
+        logger.warning("gallery-dl failed for %s: %s", url, exc)
         shutil.rmtree(temp_dir, ignore_errors=True)
         return []
 
@@ -272,6 +285,8 @@ def download_media(
             )
     except yt_dlp.utils.DownloadError as err:
         msg = str(err)
+        logger.warning("yt-dlp DownloadError for %s (mode=%s): %s", query, mode, msg)
+
         if mode in ("instagram", "twitter") and ("No video formats found" in msg or "gallery" in msg.lower()):
             photos = _download_via_gallery_dl(query, file_id, cookiefile=active_cookies)
             if photos:
@@ -281,17 +296,16 @@ def download_media(
                     "title": "Фото",
                 }
             raise MediaNotFoundError(
-                "По этой ссылке не найдено видео (похоже на пост с фото/карусель). "
-                "Не удалось скачать фото — проверьте куки Instagram или доступность поста."
+                "Не удалось получить медиа по этой ссылке — возможно, пост недоступен или ссылка неверная."
             ) from err
 
         if any(k in msg for k in ("HTTP Error 404", "Not Found", "Private video", "unavailable")):
             raise MediaNotFoundError(
-                "Файл не найден по этой ссылке — пост удалён, ссылка неверная или доступ ограничен."
+                "Файл не найден по этой ссылке — возможно, ссылка неверная или доступ к публикации ограничен."
             ) from err
 
         raise MediaNotFoundError(
-            "Не удалось загрузить медиа по этой ссылке. Проверьте корректность ссылки или попробуйте позже."
+            "Не удалось скачать файл по этой ссылке. Проверьте ссылку или попробуйте позже."
         ) from err
 
     all_files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
