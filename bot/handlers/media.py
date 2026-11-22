@@ -16,6 +16,7 @@ from aiogram.types import (
     Message,
 )
 
+from bot.config import DOWNLOAD_DIR
 from bot.services.downloader import (
     MediaNotFoundError,
     download_media,
@@ -121,6 +122,51 @@ async def _safe_edit(msg: Message, text: str):
         pass
 
 
+def _cleanup_paths(
+    file_path: str | None,
+    thumb_path: str | None,
+    photo_paths: list[str],
+) -> None:
+    """Удаляет скачанные файлы, превью и временные директории после отправки."""
+    base_dir = Path(DOWNLOAD_DIR).resolve()
+    dirs_to_remove: set[Path] = set()
+    files_to_remove: set[Path] = set()
+
+    for raw in (file_path, thumb_path, *photo_paths):
+        if not raw:
+            continue
+        p = Path(raw).resolve()
+        try:
+            p.relative_to(base_dir)
+        except ValueError:
+            continue
+
+        if p.parent != base_dir and "_gdl" in p.parent.name:
+            dirs_to_remove.add(p.parent)
+        else:
+            files_to_remove.add(p)
+            # Подчищаем возможные сопутствующие файлы с тем же stem (например .webp/.part)
+            stem = p.stem.split(".", maxsplit=1)[0]
+            if stem and p.parent == base_dir:
+                for sibling in base_dir.glob(f"{stem}*"):
+                    if sibling.is_file():
+                        files_to_remove.add(sibling)
+                    elif sibling.is_dir() and "_gdl" in sibling.name:
+                        dirs_to_remove.add(sibling)
+
+    for file_item in files_to_remove:
+        try:
+            file_item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    for dir_item in dirs_to_remove:
+        try:
+            shutil.rmtree(dir_item, ignore_errors=True)
+        except OSError:
+            pass
+
+
 async def _download_and_send(
     target_msg: Message,
     status_msg: Message,
@@ -155,8 +201,10 @@ async def _download_and_send(
                 group = [InputMediaPhoto(media=FSInputFile(p)) for p in photo_paths[:10]]
                 await target_msg.answer_media_group(media=group)
         else:
-            file_path = meta["path"]
+            file_path = meta.get("path")
             thumb_path = meta.get("thumb")
+            if not file_path:
+                raise MediaNotFoundError("Файл не найден после загрузки.")
             safe_name = f"{title[:50]}{Path(file_path).suffix}"
             media = FSInputFile(file_path, filename=safe_name)
             thumb = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
@@ -193,17 +241,7 @@ async def _download_and_send(
         )
 
     finally:
-        cleaned_dirs: set[Path] = set()
-        for path in (file_path, thumb_path, *photo_paths):
-            if not path:
-                continue
-            p = Path(path)
-            if p.parent.name.endswith("_gdl") and p.parent.exists():
-                cleaned_dirs.add(p.parent)
-            elif p.exists():
-                p.unlink(missing_ok=True)
-        for d in cleaned_dirs:
-            shutil.rmtree(d, ignore_errors=True)
+        _cleanup_paths(file_path, thumb_path, photo_paths)
 
 
 @router.message(F.text)
