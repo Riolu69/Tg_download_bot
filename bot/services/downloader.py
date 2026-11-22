@@ -6,7 +6,7 @@ from typing import Callable
 
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
-from bot.config import COOKIES_FILE, DOWNLOAD_DIR, MAX_FILE_SIZE_MB
+from bot.config import COOKIES_FILE, DOWNLOAD_DIR, IG_COOKIES_FILE, MAX_FILE_SIZE_MB
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -33,7 +33,33 @@ def _guess_image_ext(url: str, content_type: str = "") -> str:
     return ".jpg"
 
 
-def _download_image_file(url: str, dest_stem: str, impersonate: bool = False) -> Path | None:
+def _cookie_header_from_file(cookiefile: str | None) -> str | None:
+    """Собирает заголовок Cookie из Netscape cookies.txt для прямых запросов к CDN."""
+    if not cookiefile or not os.path.isfile(cookiefile):
+        return None
+    pairs: list[str] = []
+    try:
+        with open(cookiefile, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    name, value = parts[5], parts[6]
+                    if name:
+                        pairs.append(f"{name}={value}")
+    except Exception:
+        return None
+    return "; ".join(pairs) if pairs else None
+
+
+def _download_image_file(
+    url: str,
+    dest_stem: str,
+    impersonate: bool = False,
+    cookiefile: str | None = None,
+) -> Path | None:
     if not url or not url.startswith(("http://", "https://")):
         return None
     headers = {
@@ -42,11 +68,21 @@ def _download_image_file(url: str, dest_stem: str, impersonate: bool = False) ->
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
+    cookie_hdr = _cookie_header_from_file(cookiefile)
+    if cookie_hdr:
+        headers["Cookie"] = cookie_hdr
+
     try:
         if impersonate:
             from curl_cffi import requests as cffi_requests
 
-            resp = cffi_requests.get(url, impersonate="chrome", timeout=20, allow_redirects=True)
+            resp = cffi_requests.get(
+                url,
+                headers=headers,
+                impersonate="chrome",
+                timeout=20,
+                allow_redirects=True,
+            )
             if resp.status_code >= 400 or not resp.content:
                 return None
             ext = _guess_image_ext(url, resp.headers.get("content-type", ""))
@@ -70,7 +106,6 @@ def _download_image_file(url: str, dest_stem: str, impersonate: bool = False) ->
 def _collect_image_urls(obj: object, out: list[str], seen: set[str]):
     """Рекурсивно собирает URL картинок из метаданных yt-dlp (включая карусели)."""
     if isinstance(obj, dict):
-        # Пропускаем видеоэлементы
         if obj.get("vcodec") and obj.get("vcodec") != "none":
             return
 
@@ -105,7 +140,12 @@ def _collect_image_urls(obj: object, out: list[str], seen: set[str]):
             _collect_image_urls(item, out, seen)
 
 
-def _extract_images_from_info(info: dict, file_id: str, impersonate: bool = False) -> list[str]:
+def _extract_images_from_info(
+    info: dict,
+    file_id: str,
+    impersonate: bool = False,
+    cookiefile: str | None = None,
+) -> list[str]:
     """Скачивает найденные изображения из метаданных поста/карусели."""
     urls: list[str] = []
     seen: set[str] = set()
@@ -114,7 +154,12 @@ def _extract_images_from_info(info: dict, file_id: str, impersonate: bool = Fals
     saved_paths: list[str] = []
     for idx, img_url in enumerate(urls[:10]):
         stem = f"{file_id}_img_{idx}"
-        path = _download_image_file(img_url, stem, impersonate=impersonate)
+        path = _download_image_file(
+            img_url,
+            stem,
+            impersonate=impersonate,
+            cookiefile=cookiefile,
+        )
         if path and path.exists() and path.stat().st_size > 0:
             saved_paths.append(str(path))
 
@@ -161,6 +206,7 @@ def download_media(
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
     last_update = 0.0
     use_impersonate = mode in ("instagram", "tiktok")
+    active_cookies = IG_COOKIES_FILE if mode == "instagram" else COOKIES_FILE
 
     def progress_hook(d: dict):
         nonlocal last_update
@@ -211,8 +257,8 @@ def download_media(
         ],
     }
 
-    if COOKIES_FILE:
-        ydl_opts["cookiefile"] = COOKIES_FILE
+    if active_cookies:
+        ydl_opts["cookiefile"] = active_cookies
 
     if mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio"):
         ydl_opts["format"] = "bestaudio/best"
@@ -261,7 +307,12 @@ def download_media(
                 meta_opts["writethumbnail"] = False
                 with yt_dlp.YoutubeDL(meta_opts) as ydl:
                     raw_info = ydl.extract_info(query, download=False) or {}
-                photos = _extract_images_from_info(raw_info, file_id, impersonate=use_impersonate)
+                photos = _extract_images_from_info(
+                    raw_info,
+                    file_id,
+                    impersonate=use_impersonate,
+                    cookiefile=active_cookies,
+                )
                 if photos:
                     return {
                         "type": "photos",
@@ -272,7 +323,7 @@ def download_media(
                 pass
             raise MediaNotFoundError(
                 "По этой ссылке не найдено видео (похоже на пост с фото/карусель). "
-                "Instagram часто не отдаёт фото по ссылке без авторизации."
+                "Не удалось извлечь фото — проверьте куки Instagram или доступность поста."
             ) from err
 
         if any(k in msg for k in ("HTTP Error 404", "Not Found", "Private video", "unavailable")):
@@ -289,7 +340,12 @@ def download_media(
     thumb_files = [f for f in all_files if f.suffix.lower() == ".jpg"]
 
     if not media_files and mode in ("instagram", "twitter"):
-        photos = _extract_images_from_info(info, file_id, impersonate=use_impersonate)
+        photos = _extract_images_from_info(
+            info,
+            file_id,
+            impersonate=use_impersonate,
+            cookiefile=active_cookies,
+        )
         for f in thumb_files:
             f.unlink(missing_ok=True)
         if photos:
