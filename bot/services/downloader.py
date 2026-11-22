@@ -56,40 +56,13 @@ def _estimate_format_bytes(fmt: dict, duration: float | None, is_audio: bool = F
     return None
 
 
-def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
-    """Оценивает примерный размер для качеств 1080/720/480/360 и audio без скачивания файла."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "source_address": "0.0.0.0",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["mweb"],
-            }
-        },
-    }
-    if COOKIES_FILE:
-        ydl_opts["cookiefile"] = COOKIES_FILE
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False) or {}
-    except Exception as exc:
-        logger.debug("Failed to fetch size hints for %s: %s", url, exc)
-        return {}
-
-    if isinstance(info, dict) and "entries" in info and info["entries"]:
-        info = info["entries"][0] or {}
-
+def _compute_hints_from_info(info: dict) -> dict[str, str]:
     formats = info.get("formats") or []
     duration = info.get("duration")
     if not isinstance(formats, list) or not formats:
         return {}
 
-    # Собираем аудиопотоки
     audio_items: list[tuple[float, int]] = []
-    # Собираем видеопотоки: (height, is_avc1, has_audio, bitrate_or_size, est_bytes)
     video_items: list[tuple[int, int, int, float, int]] = []
 
     for fmt in formats:
@@ -126,30 +99,73 @@ def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
         if aud_str:
             hints["audio"] = aud_str
 
+    seen_video_sizes: set[str] = set()
     for q in ("1080", "720", "480", "360"):
         max_h = int(q)
-        # Предпочитаем точное совпадение высоты, иначе максимальную доступную <= max_h
         eligible = [item for item in video_items if item[0] <= max_h]
         if not eligible:
             continue
 
-        # Выбираем лучший поток под конкретный потолок разрешения:
-        # сначала avc1 и ближе к max_h, затем по битрейту/размеру
         best_v = max(
             eligible,
             key=lambda item: (
-                item[0],          # height (ближе к max_h)
-                item[1],          # avc1 приоритет
-                item[3],          # bitrate / size
+                item[0],
+                item[1],
+                item[3],
             ),
         )
         _, _, has_aud, _, v_bytes = best_v
         total_bytes = v_bytes + (best_audio_bytes if (not has_aud and best_audio_bytes) else 0)
         v_str = _format_size_human(total_bytes)
-        if v_str:
+        if v_str and v_str not in seen_video_sizes:
+            seen_video_sizes.add(v_str)
             hints[q] = v_str
 
     return hints
+
+
+def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
+    """Оценивает примерный размер для качеств 1080/720/480/360 и audio без скачивания файла."""
+    base_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "source_address": "0.0.0.0",
+    }
+    if COOKIES_FILE:
+        base_opts["cookiefile"] = COOKIES_FILE
+
+    mweb_opts = {
+        **base_opts,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb"],
+            }
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(mweb_opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        if isinstance(info, dict) and "entries" in info and info["entries"]:
+            info = info["entries"][0] or {}
+        hints = _compute_hints_from_info(info)
+
+        video_only_values = [hints.get(k) for k in ("1080", "720", "480", "360") if hints.get(k)]
+        if len(set(video_only_values)) <= 1:
+            with yt_dlp.YoutubeDL(base_opts) as ydl:
+                alt_info = ydl.extract_info(url, download=False) or {}
+            if isinstance(alt_info, dict) and "entries" in alt_info and alt_info["entries"]:
+                alt_info = alt_info["entries"][0] or {}
+            alt_hints = _compute_hints_from_info(alt_info)
+            alt_video_values = [alt_hints.get(k) for k in ("1080", "720", "480", "360") if alt_hints.get(k)]
+            if len(set(alt_video_values)) > len(set(video_only_values)):
+                return alt_hints
+
+        return hints
+    except Exception as exc:
+        logger.debug("Failed to fetch size hints for %s: %s", url, exc)
+        return {}
 
 
 def _guess_image_ext(url: str, content_type: str = "") -> str:
