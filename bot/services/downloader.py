@@ -38,14 +38,21 @@ def _format_size_human(num_bytes: int | float | None) -> str | None:
     return f"~{mb:.1f} МБ"
 
 
-def _fmt_bytes(fmt: dict, duration: float | None = None) -> int | None:
+def _estimate_format_bytes(fmt: dict, duration: float | None, is_audio: bool = False) -> int | None:
     size = fmt.get("filesize") or fmt.get("filesize_approx")
-    if size:
+    if size and int(size) > 0:
         return int(size)
-    tbr = fmt.get("tbr") or ((fmt.get("vbr") or 0) + (fmt.get("abr") or 0))
-    if tbr and duration and duration > 0:
-        # tbr задан в килобитах в секунду (kbps)
-        return int(tbr * 1000 / 8 * duration)
+
+    if duration and duration > 0:
+        if is_audio:
+            abr = fmt.get("abr") or fmt.get("tbr")
+            if abr and float(abr) > 0:
+                return int(float(abr) * 1000 / 8 * duration)
+        else:
+            vbr = fmt.get("vbr") or fmt.get("tbr")
+            if vbr and float(vbr) > 0:
+                return int(float(vbr) * 1000 / 8 * duration)
+
     return None
 
 
@@ -80,55 +87,67 @@ def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
     if not isinstance(formats, list) or not formats:
         return {}
 
-    audio_candidates: list[tuple[int, int]] = []
-    video_candidates: list[tuple[int, int, int]] = []
+    # Собираем аудиопотоки
+    audio_items: list[tuple[float, int]] = []
+    # Собираем видеопотоки: (height, is_avc1, has_audio, bitrate_or_size, est_bytes)
+    video_items: list[tuple[int, int, int, float, int]] = []
 
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
         vcodec = fmt.get("vcodec") or "none"
         acodec = fmt.get("acodec") or "none"
-        height = fmt.get("height") or 0
-        f_size = _fmt_bytes(fmt, duration)
+        height = int(fmt.get("height") or 0)
 
-        if vcodec == "none" and acodec != "none" and f_size:
-            abr = int(fmt.get("abr") or fmt.get("tbr") or 0)
-            audio_candidates.append((abr, f_size))
+        if vcodec == "none" and acodec != "none":
+            est_a = _estimate_format_bytes(fmt, duration, is_audio=True)
+            if est_a:
+                abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
+                audio_items.append((abr, est_a))
 
-        if vcodec != "none" and height > 0 and f_size:
-            has_audio = 1 if acodec != "none" else 0
-            tbr = int(fmt.get("tbr") or fmt.get("vbr") or 0)
-            video_candidates.append((height, has_audio * 100000 + tbr, f_size))
+        if vcodec != "none" and height > 0:
+            est_v = _estimate_format_bytes(fmt, duration, is_audio=False)
+            if est_v:
+                is_avc = 1 if str(vcodec).startswith("avc1") else 0
+                has_aud = 1 if acodec != "none" else 0
+                br = float(fmt.get("vbr") or fmt.get("tbr") or est_v)
+                video_items.append((height, is_avc, has_aud, br, est_v))
 
     hints: dict[str, str] = {}
 
-    best_audio_size = max((sz for _, sz in audio_candidates), default=None)
-    if best_audio_size:
-        # Для MP3 192 kbps оценка близка к длительности * 24 КБ/с, но не больше исходного аудиопотока
-        if duration and duration > 0:
-            mp3_est = min(best_audio_size, int(duration * 192 * 1000 / 8))
-            formatted_aud = _format_size_human(mp3_est)
+    best_audio_bytes: int | None = None
+    if audio_items:
+        _, best_audio_bytes = max(audio_items, key=lambda item: item[0])
+        if duration and float(duration) > 0:
+            mp3_bytes = min(best_audio_bytes, int(float(duration) * 192 * 1000 / 8))
         else:
-            formatted_aud = _format_size_human(best_audio_size)
-        if formatted_aud:
-            hints["audio"] = formatted_aud
+            mp3_bytes = best_audio_bytes
+        aud_str = _format_size_human(mp3_bytes)
+        if aud_str:
+            hints["audio"] = aud_str
 
     for q in ("1080", "720", "480", "360"):
         max_h = int(q)
-        matching = [
-            (score, sz)
-            for h, score, sz in video_candidates
-            if h <= max_h
-        ]
-        if not matching:
+        # Предпочитаем точное совпадение высоты, иначе максимальную доступную <= max_h
+        eligible = [item for item in video_items if item[0] <= max_h]
+        if not eligible:
             continue
-        _, v_size = max(matching, key=lambda item: item[0])
-        # Если видеопоток без звука (score < 100000), прибавляем лучший аудиопоток
-        best_v_score = max(matching, key=lambda item: item[0])[0]
-        total_size = v_size + (best_audio_size if (best_v_score < 100000 and best_audio_size) else 0)
-        formatted_v = _format_size_human(total_size)
-        if formatted_v:
-            hints[q] = formatted_v
+
+        # Выбираем лучший поток под конкретный потолок разрешения:
+        # сначала avc1 и ближе к max_h, затем по битрейту/размеру
+        best_v = max(
+            eligible,
+            key=lambda item: (
+                item[0],          # height (ближе к max_h)
+                item[1],          # avc1 приоритет
+                item[3],          # bitrate / size
+            ),
+        )
+        _, _, has_aud, _, v_bytes = best_v
+        total_bytes = v_bytes + (best_audio_bytes if (not has_aud and best_audio_bytes) else 0)
+        v_str = _format_size_human(total_bytes)
+        if v_str:
+            hints[q] = v_str
 
     return hints
 
