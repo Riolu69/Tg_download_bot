@@ -23,8 +23,9 @@ INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/.+")
 TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.|vt\.|m\.)?tiktok\.com/.+")
 VK_CLIP_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/clip-?\d+_\d+.*")
 VK_VIDEO_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/(video-?\d+_\d+|.*z=video-?\d+_\d+).*")
+TWITTER_RE = re.compile(r"(https?://)?(www\.|m\.|mobile\.)?(twitter\.com|x\.com)/.+")
 
-SHORT_VIDEO_MODES = {"instagram", "tiktok", "vk_clip"}
+SHORT_VIDEO_MODES = {"instagram", "tiktok", "vk_clip", "twitter"}
 
 # Временное хранилище ссылок (callback_data ограничена 64 байтами)
 URL_CACHE: dict[str, str] = {}
@@ -182,6 +183,12 @@ async def handle_text(message: Message):
         header = "Скачиваю VK Клип..."
         status_msg = await message.answer(header)
         await _download_and_send(message, status_msg, text, "vk_clip", header=header)
+        return
+
+    if TWITTER_RE.match(text):
+        header = "Скачиваю из Twitter (X)..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "twitter", header=header)
         return
 
     # Поиск музыки с выбором трека
