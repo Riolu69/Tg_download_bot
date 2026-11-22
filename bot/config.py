@@ -18,3 +18,6 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 COOKIES_FILE = str(COOKIES_PATH) if COOKIES_PATH.exists() else None
+
+IG_COOKIES_PATH = Path(os.getenv("IG_COOKIES_FILE", str(BASE_DIR / "ig_cookies.txt")))
+IG_COOKIES_FILE = str(IG_COOKIES_PATH) if IG_COOKIES_PATH.exists() else None
