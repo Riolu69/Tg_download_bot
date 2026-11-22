@@ -11,6 +11,7 @@ from typing import Callable
 
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
+
 from bot.config import COOKIES_FILE, DOWNLOAD_DIR, IG_COOKIES_FILE, MAX_FILE_SIZE_MB
 
 logger = logging.getLogger(__name__)
@@ -43,15 +44,16 @@ def _estimate_format_bytes(fmt: dict, duration: float | None, is_audio: bool = F
     if size and int(size) > 0:
         return int(size)
 
-    if duration and duration > 0:
+    if duration and float(duration) > 0:
+        dur = float(duration)
         if is_audio:
-            abr = fmt.get("abr") or fmt.get("tbr")
+            abr = fmt.get("abr")
             if abr and float(abr) > 0:
-                return int(float(abr) * 1000 / 8 * duration)
+                return int(float(abr) * 1000 / 8 * dur)
         else:
-            vbr = fmt.get("vbr") or fmt.get("tbr")
+            vbr = fmt.get("vbr")
             if vbr and float(vbr) > 0:
-                return int(float(vbr) * 1000 / 8 * duration)
+                return int(float(vbr) * 1000 / 8 * dur)
 
     return None
 
@@ -62,29 +64,32 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
     if not isinstance(formats, list) or not formats:
         return {}
 
-    audio_items: list[tuple[float, int]] = []
-    video_items: list[tuple[int, int, int, float, int]] = []
+    audio_items: list[tuple[int, int]] = []
+    video_items: list[tuple[int, int, int, int, float, int]] = []
 
     for fmt in formats:
         if not isinstance(fmt, dict):
             continue
-        vcodec = fmt.get("vcodec") or "none"
-        acodec = fmt.get("acodec") or "none"
+        vcodec = str(fmt.get("vcodec") or "none")
+        acodec = str(fmt.get("acodec") or "none")
+        ext = str(fmt.get("ext") or "")
         height = int(fmt.get("height") or 0)
 
         if vcodec == "none" and acodec != "none":
             est_a = _estimate_format_bytes(fmt, duration, is_audio=True)
             if est_a:
-                abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
-                audio_items.append((abr, est_a))
+                is_m4a = 1 if ext == "m4a" else 0
+                abr = int(float(fmt.get("abr") or 0))
+                audio_items.append((is_m4a * 10000 + abr, est_a))
 
         if vcodec != "none" and height > 0:
             est_v = _estimate_format_bytes(fmt, duration, is_audio=False)
             if est_v:
-                is_avc = 1 if str(vcodec).startswith("avc1") else 0
+                is_avc = 1 if vcodec.startswith("avc1") else 0
+                is_mp4 = 1 if ext == "mp4" else 0
                 has_aud = 1 if acodec != "none" else 0
-                br = float(fmt.get("vbr") or fmt.get("tbr") or est_v)
-                video_items.append((height, is_avc, has_aud, br, est_v))
+                br = float(fmt.get("vbr") or 0)
+                video_items.append((height, is_avc, is_mp4, has_aud, br, est_v))
 
     hints: dict[str, str] = {}
 
@@ -111,10 +116,11 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
             key=lambda item: (
                 item[0],
                 item[1],
-                item[3],
+                item[2],
+                item[4],
             ),
         )
-        _, _, has_aud, _, v_bytes = best_v
+        _, _, _, has_aud, _, v_bytes = best_v
         total_bytes = v_bytes + (best_audio_bytes if (not has_aud and best_audio_bytes) else 0)
         v_str = _format_size_human(total_bytes)
         if v_str and v_str not in seen_video_sizes:
