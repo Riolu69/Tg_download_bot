@@ -67,26 +67,22 @@ def _download_image_file(url: str, dest_stem: str, impersonate: bool = False) ->
         return None
 
 
-def _extract_images_from_info(info: dict, file_id: str, impersonate: bool = False) -> list[str]:
-    """Пытается скачать фото/карусель из метаданных yt-dlp."""
-    entries = info.get("entries") if isinstance(info.get("entries"), list) else [info]
-    saved_paths: list[str] = []
+def _collect_image_urls(obj: object, out: list[str], seen: set[str]):
+    """Рекурсивно собирает URL картинок из метаданных yt-dlp (включая карусели)."""
+    if isinstance(obj, dict):
+        # Пропускаем видеоэлементы
+        if obj.get("vcodec") and obj.get("vcodec") != "none":
+            return
 
-    for idx, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        # Если у элемента есть видеоформаты — это видео, не фото
-        if entry.get("vcodec") and entry.get("vcodec") != "none":
-            continue
+        for key in ("url", "display_url"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                ext = Path(val.split("?")[0]).suffix.lower()
+                if ext in IMAGE_EXTS and val not in seen:
+                    seen.add(val)
+                    out.append(val)
 
-        candidates: list[str] = []
-        direct_url = entry.get("url")
-        if isinstance(direct_url, str) and direct_url.startswith("http"):
-            ext = Path(direct_url.split("?")[0]).suffix.lower()
-            if ext in IMAGE_EXTS or not ext:
-                candidates.append(direct_url)
-
-        thumbs = entry.get("thumbnails")
+        thumbs = obj.get("thumbnails")
         if isinstance(thumbs, list) and thumbs:
             best_thumb = max(
                 (t for t in thumbs if isinstance(t, dict) and t.get("url")),
@@ -94,14 +90,33 @@ def _extract_images_from_info(info: dict, file_id: str, impersonate: bool = Fals
                 default=None,
             )
             if best_thumb:
-                candidates.append(best_thumb["url"])
+                t_url = best_thumb["url"]
+                if t_url not in seen:
+                    seen.add(t_url)
+                    out.append(t_url)
 
-        for c_idx, img_url in enumerate(candidates):
-            stem = f"{file_id}_img_{idx}_{c_idx}"
-            path = _download_image_file(img_url, stem, impersonate=impersonate)
-            if path and path.exists() and path.stat().st_size > 0:
-                saved_paths.append(str(path))
-                break
+        for key in ("entries", "carousel_media", "items"):
+            child = obj.get(key)
+            if isinstance(child, list):
+                for item in child:
+                    _collect_image_urls(item, out, seen)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_image_urls(item, out, seen)
+
+
+def _extract_images_from_info(info: dict, file_id: str, impersonate: bool = False) -> list[str]:
+    """Скачивает найденные изображения из метаданных поста/карусели."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    _collect_image_urls(info, urls, seen)
+
+    saved_paths: list[str] = []
+    for idx, img_url in enumerate(urls[:10]):
+        stem = f"{file_id}_img_{idx}"
+        path = _download_image_file(img_url, stem, impersonate=impersonate)
+        if path and path.exists() and path.stat().st_size > 0:
+            saved_paths.append(str(path))
 
     return saved_paths
 
@@ -229,13 +244,20 @@ def download_media(
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             extracted = ydl.extract_info(query, download=True)
-            info = extracted["entries"][0] if isinstance(extracted, dict) and "entries" in extracted and extracted["entries"] else (extracted or {})
+            info = (
+                extracted["entries"][0]
+                if isinstance(extracted, dict) and "entries" in extracted and extracted["entries"]
+                else (extracted or {})
+            )
     except yt_dlp.utils.DownloadError as err:
         msg = str(err)
-        # Если по ссылке фото/пост без видео — пробуем вытащить метаданные без скачивания видео
         if "No video formats found" in msg and mode in ("instagram", "twitter"):
             try:
-                meta_opts = {k: v for k, v in ydl_opts.items() if k not in ("format", "merge_output_format", "progress_hooks")}
+                meta_opts = {
+                    k: v
+                    for k, v in ydl_opts.items()
+                    if k not in ("format", "merge_output_format", "progress_hooks")
+                }
                 meta_opts["writethumbnail"] = False
                 with yt_dlp.YoutubeDL(meta_opts) as ydl:
                     raw_info = ydl.extract_info(query, download=False) or {}
@@ -249,7 +271,8 @@ def download_media(
             except Exception:
                 pass
             raise MediaNotFoundError(
-                "По этой ссылке не найдено видео — возможно, это пост с фото, закрытый аккаунт или неверная ссылка."
+                "По этой ссылке не найдено видео (похоже на пост с фото/карусель). "
+                "Instagram часто не отдаёт фото по ссылке без авторизации."
             ) from err
 
         if any(k in msg for k in ("HTTP Error 404", "Not Found", "Private video", "unavailable")):
@@ -258,14 +281,13 @@ def download_media(
             ) from err
 
         raise MediaNotFoundError(
-            "Не удалось загрузить медиа по этой ссылке. Проверьте корректность ссылки и попробуйте позже."
+            "Не удалось загрузить медиа по этой ссылке. Проверьте корректность ссылки или попробуйте позже."
         ) from err
 
     all_files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
     media_files = [f for f in all_files if f.suffix.lower() not in IMAGE_EXTS]
     thumb_files = [f for f in all_files if f.suffix.lower() == ".jpg"]
 
-    # Если видеоформата нет, но yt-dlp вернул фото/карусель
     if not media_files and mode in ("instagram", "twitter"):
         photos = _extract_images_from_info(info, file_id, impersonate=use_impersonate)
         for f in thumb_files:
