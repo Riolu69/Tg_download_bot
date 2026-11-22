@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
+MAX_REASONABLE_VBR_BY_HEIGHT: dict[int, float] = {
+    360: 1800.0,
+    480: 3500.0,
+    720: 7000.0,
+    1080: 12000.0,
+}
+
+YT_CLIENTS = ["mweb", "web"]
+
 
 class MediaNotFoundError(Exception):
     """Понятная ошибка для пользователя, когда медиа не найдено или недоступно."""
@@ -39,23 +48,40 @@ def _format_size_human(num_bytes: int | float | None) -> str | None:
     return f"~{mb:.1f} МБ"
 
 
-def _estimate_format_bytes(fmt: dict, duration: float | None, is_audio: bool = False) -> int | None:
-    size = fmt.get("filesize") or fmt.get("filesize_approx")
-    if size and int(size) > 0:
-        return int(size)
+def _estimate_format_bytes(
+    fmt: dict,
+    duration: float | None,
+    is_audio: bool = False,
+    target_height: int | None = None,
+) -> tuple[int | None, bool]:
+    """Возвращает (оценка_байт, признак_надёжности)."""
+    exact_size = fmt.get("filesize")
+    if exact_size and int(exact_size) > 0:
+        return int(exact_size), True
+
+    approx_size = fmt.get("filesize_approx")
+    if approx_size and int(approx_size) > 0:
+        est = int(approx_size)
+        if not is_audio and target_height and duration and float(duration) > 0:
+            max_vbr = MAX_REASONABLE_VBR_BY_HEIGHT.get(target_height, 15000.0)
+            max_sensible_bytes = int(max_vbr * 1000 / 8 * float(duration) * 1.5)
+            if est > max_sensible_bytes:
+                return None, False
+        return est, False
 
     if duration and float(duration) > 0:
         dur = float(duration)
         if is_audio:
             abr = fmt.get("abr")
-            if abr and float(abr) > 0:
-                return int(float(abr) * 1000 / 8 * dur)
+            if abr and 0 < float(abr) <= 320:
+                return int(float(abr) * 1000 / 8 * dur), False
         else:
             vbr = fmt.get("vbr")
-            if vbr and float(vbr) > 0:
-                return int(float(vbr) * 1000 / 8 * dur)
+            cap = MAX_REASONABLE_VBR_BY_HEIGHT.get(target_height or 1080, 15000.0)
+            if vbr and 0 < float(vbr) <= cap:
+                return int(float(vbr) * 1000 / 8 * dur), False
 
-    return None
+    return None, False
 
 
 def _compute_hints_from_info(info: dict) -> dict[str, str]:
@@ -64,8 +90,8 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
     if not isinstance(formats, list) or not formats:
         return {}
 
-    audio_items: list[tuple[int, int]] = []
-    video_items: list[tuple[int, int, int, int, float, int]] = []
+    audio_items: list[tuple[int, int, bool]] = []
+    raw_video_formats: list[dict] = []
 
     for fmt in formats:
         if not isinstance(fmt, dict):
@@ -76,26 +102,21 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
         height = int(fmt.get("height") or 0)
 
         if vcodec == "none" and acodec != "none":
-            est_a = _estimate_format_bytes(fmt, duration, is_audio=True)
+            est_a, reliable_a = _estimate_format_bytes(fmt, duration, is_audio=True)
             if est_a:
                 is_m4a = 1 if ext == "m4a" else 0
                 abr = int(float(fmt.get("abr") or 0))
-                audio_items.append((is_m4a * 10000 + abr, est_a))
+                audio_items.append((is_m4a * 10000 + abr, est_a, reliable_a))
 
         if vcodec != "none" and height > 0:
-            est_v = _estimate_format_bytes(fmt, duration, is_audio=False)
-            if est_v:
-                is_avc = 1 if vcodec.startswith("avc1") else 0
-                is_mp4 = 1 if ext == "mp4" else 0
-                has_aud = 1 if acodec != "none" else 0
-                br = float(fmt.get("vbr") or 0)
-                video_items.append((height, is_avc, is_mp4, has_aud, br, est_v))
+            raw_video_formats.append(fmt)
 
     hints: dict[str, str] = {}
 
     best_audio_bytes: int | None = None
+    best_audio_reliable = False
     if audio_items:
-        _, best_audio_bytes = max(audio_items, key=lambda item: item[0])
+        _, best_audio_bytes, best_audio_reliable = max(audio_items, key=lambda item: item[0])
         if duration and float(duration) > 0:
             mp3_bytes = min(best_audio_bytes, int(float(duration) * 192 * 1000 / 8))
         else:
@@ -104,24 +125,52 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
         if aud_str:
             hints["audio"] = aud_str
 
+    prev_bytes: int | None = None
     seen_video_sizes: set[str] = set()
+
     for q in ("1080", "720", "480", "360"):
         max_h = int(q)
-        eligible = [item for item in video_items if item[0] <= max_h]
-        if not eligible:
+        candidates: list[tuple[int, int, int, float, int, bool, bool]] = []
+
+        for fmt in raw_video_formats:
+            h = int(fmt.get("height") or 0)
+            if h <= 0 or h > max_h:
+                continue
+            est_v, reliable_v = _estimate_format_bytes(
+                fmt,
+                duration,
+                is_audio=False,
+                target_height=max_h,
+            )
+            if not est_v:
+                continue
+            vcodec = str(fmt.get("vcodec") or "none")
+            acodec = str(fmt.get("acodec") or "none")
+            ext = str(fmt.get("ext") or "")
+            is_avc = 1 if vcodec.startswith("avc1") else 0
+            is_mp4 = 1 if ext == "mp4" else 0
+            has_aud = 1 if acodec != "none" else 0
+            br = float(fmt.get("vbr") or 0)
+            candidates.append((h, is_avc, is_mp4, br, est_v, bool(has_aud), reliable_v))
+
+        if not candidates:
             continue
 
-        best_v = max(
-            eligible,
-            key=lambda item: (
-                item[0],
-                item[1],
-                item[2],
-                item[4],
-            ),
+        _, _, _, _, v_bytes, has_aud, reliable_v = max(
+            candidates,
+            key=lambda item: (item[0], item[1], item[2], item[3]),
         )
-        _, _, _, has_aud, _, v_bytes = best_v
-        total_bytes = v_bytes + (best_audio_bytes if (not has_aud and best_audio_bytes) else 0)
+
+        need_audio = (not has_aud) and (best_audio_bytes is not None)
+        total_bytes = v_bytes + (best_audio_bytes if need_audio else 0)
+        is_reliable = reliable_v and (not need_audio or best_audio_reliable)
+
+        if not is_reliable:
+            continue
+        if prev_bytes is not None and total_bytes >= prev_bytes:
+            continue
+
+        prev_bytes = total_bytes
         v_str = _format_size_human(total_bytes)
         if v_str and v_str not in seen_video_sizes:
             seen_video_sizes.add(v_str)
@@ -132,43 +181,26 @@ def _compute_hints_from_info(info: dict) -> dict[str, str]:
 
 def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
     """Оценивает примерный размер для качеств 1080/720/480/360 и audio без скачивания файла."""
-    base_opts = {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "source_address": "0.0.0.0",
-    }
-    if COOKIES_FILE:
-        base_opts["cookiefile"] = COOKIES_FILE
-
-    mweb_opts = {
-        **base_opts,
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb"],
+                "player_client": YT_CLIENTS,
             }
         },
     }
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
 
     try:
-        with yt_dlp.YoutubeDL(mweb_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
         if isinstance(info, dict) and "entries" in info and info["entries"]:
             info = info["entries"][0] or {}
-        hints = _compute_hints_from_info(info)
-
-        video_only_values = [hints.get(k) for k in ("1080", "720", "480", "360") if hints.get(k)]
-        if len(set(video_only_values)) <= 1:
-            with yt_dlp.YoutubeDL(base_opts) as ydl:
-                alt_info = ydl.extract_info(url, download=False) or {}
-            if isinstance(alt_info, dict) and "entries" in alt_info and alt_info["entries"]:
-                alt_info = alt_info["entries"][0] or {}
-            alt_hints = _compute_hints_from_info(alt_info)
-            alt_video_values = [alt_hints.get(k) for k in ("1080", "720", "480", "360") if alt_hints.get(k)]
-            if len(set(alt_video_values)) > len(set(video_only_values)):
-                return alt_hints
-
-        return hints
+        return _compute_hints_from_info(info)
     except Exception as exc:
         logger.debug("Failed to fetch size hints for %s: %s", url, exc)
         return {}
@@ -384,7 +416,7 @@ def download_media(
         "progress_hooks": [progress_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb"],
+                "player_client": YT_CLIENTS,
             }
         },
         "postprocessors": [
@@ -477,6 +509,16 @@ def download_media(
             f"Файл не найден по этой ссылке (возможно, ссылка неверная или превышен лимит {MAX_FILE_SIZE_MB} МБ)."
         )
 
+    actual_height = info.get("height")
+    logger.info(
+        "Downloaded media mode=%s requested_q=%s actual=%sx%s title=%s",
+        mode,
+        quality,
+        info.get("width"),
+        actual_height,
+        info.get("title"),
+    )
+
     is_audio = mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio")
     return {
         "type": "audio" if is_audio else "video",
@@ -484,6 +526,6 @@ def download_media(
         "thumb": str(thumb_files[0]) if thumb_files else None,
         "title": info.get("title", "media"),
         "width": info.get("width"),
-        "height": info.get("height"),
+        "height": actual_height,
         "duration": int(info["duration"]) if info.get("duration") else None,
     }
