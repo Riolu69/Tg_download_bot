@@ -27,6 +27,112 @@ def _build_bar(percent: float, length: int = 10) -> str:
     return "█" * filled + "░" * (length - filled)
 
 
+def _format_size_human(num_bytes: int | float | None) -> str | None:
+    if not num_bytes or num_bytes <= 0:
+        return None
+    mb = num_bytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"~{mb / 1024:.1f} ГБ"
+    if mb >= 100:
+        return f"~{mb:.0f} МБ"
+    return f"~{mb:.1f} МБ"
+
+
+def _fmt_bytes(fmt: dict, duration: float | None = None) -> int | None:
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+    tbr = fmt.get("tbr") or ((fmt.get("vbr") or 0) + (fmt.get("abr") or 0))
+    if tbr and duration and duration > 0:
+        # tbr задан в килобитах в секунду (kbps)
+        return int(tbr * 1000 / 8 * duration)
+    return None
+
+
+def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
+    """Оценивает примерный размер для качеств 1080/720/480/360 и audio без скачивания файла."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "source_address": "0.0.0.0",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb"],
+            }
+        },
+    }
+    if COOKIES_FILE:
+        ydl_opts["cookiefile"] = COOKIES_FILE
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+    except Exception as exc:
+        logger.debug("Failed to fetch size hints for %s: %s", url, exc)
+        return {}
+
+    if isinstance(info, dict) and "entries" in info and info["entries"]:
+        info = info["entries"][0] or {}
+
+    formats = info.get("formats") or []
+    duration = info.get("duration")
+    if not isinstance(formats, list) or not formats:
+        return {}
+
+    audio_candidates: list[tuple[int, int]] = []
+    video_candidates: list[tuple[int, int, int]] = []
+
+    for fmt in formats:
+        if not isinstance(fmt, dict):
+            continue
+        vcodec = fmt.get("vcodec") or "none"
+        acodec = fmt.get("acodec") or "none"
+        height = fmt.get("height") or 0
+        f_size = _fmt_bytes(fmt, duration)
+
+        if vcodec == "none" and acodec != "none" and f_size:
+            abr = int(fmt.get("abr") or fmt.get("tbr") or 0)
+            audio_candidates.append((abr, f_size))
+
+        if vcodec != "none" and height > 0 and f_size:
+            has_audio = 1 if acodec != "none" else 0
+            tbr = int(fmt.get("tbr") or fmt.get("vbr") or 0)
+            video_candidates.append((height, has_audio * 100000 + tbr, f_size))
+
+    hints: dict[str, str] = {}
+
+    best_audio_size = max((sz for _, sz in audio_candidates), default=None)
+    if best_audio_size:
+        # Для MP3 192 kbps оценка близка к длительности * 24 КБ/с, но не больше исходного аудиопотока
+        if duration and duration > 0:
+            mp3_est = min(best_audio_size, int(duration * 192 * 1000 / 8))
+            formatted_aud = _format_size_human(mp3_est)
+        else:
+            formatted_aud = _format_size_human(best_audio_size)
+        if formatted_aud:
+            hints["audio"] = formatted_aud
+
+    for q in ("1080", "720", "480", "360"):
+        max_h = int(q)
+        matching = [
+            (score, sz)
+            for h, score, sz in video_candidates
+            if h <= max_h
+        ]
+        if not matching:
+            continue
+        _, v_size = max(matching, key=lambda item: item[0])
+        # Если видеопоток без звука (score < 100000), прибавляем лучший аудиопоток
+        best_v_score = max(matching, key=lambda item: item[0])[0]
+        total_size = v_size + (best_audio_size if (best_v_score < 100000 and best_audio_size) else 0)
+        formatted_v = _format_size_human(total_size)
+        if formatted_v:
+            hints[q] = formatted_v
+
+    return hints
+
+
 def _guess_image_ext(url: str, content_type: str = "") -> str:
     clean_url = url.split("?", maxsplit=1)[0].lower()
     for ext in IMAGE_EXTS:
