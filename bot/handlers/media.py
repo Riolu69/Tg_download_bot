@@ -152,12 +152,12 @@ async def _download_and_send(
     except MediaNotFoundError as e:
         await _safe_edit(
             status_msg,
-            f"⚠️ <b>Медиа не найдено</b>\n{e}",
+            f"⚠️ Медиа не найдено\n{e}",
         )
     except Exception:
         await _safe_edit(
             status_msg,
-            "⚠️ <b>Не удалось загрузить файл</b>\nСсылка неверная, файл не найден или сервис временно недоступен.",
+            "⚠️ Не удалось загрузить файл\nСсылка неверная, файл не найден или сервис временно недоступен.",
         )
 
     finally:
