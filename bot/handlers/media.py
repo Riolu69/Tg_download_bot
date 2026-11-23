@@ -27,6 +27,7 @@ from bot.services.downloader import (
 router = Router()
 
 YOUTUBE_RE = re.compile(r"(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be)/.+")
+RUTUBE_RE = re.compile(r"(https?://)?(www\.|m\.)?rutube\.ru/(video|shorts|yappy)/.+")
 INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/.+")
 TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.|vt\.|m\.)?tiktok\.com/.+")
 VK_CLIP_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/clip-?\d+_\d+.*")
@@ -145,7 +146,6 @@ def _cleanup_paths(
             dirs_to_remove.add(p.parent)
         else:
             files_to_remove.add(p)
-            # Подчищаем возможные сопутствующие файлы с тем же stem (например .webp/.part)
             stem = p.stem.split(".", maxsplit=1)[0]
             if stem and p.parent == base_dir:
                 for sibling in base_dir.glob(f"{stem}*"):
@@ -255,6 +255,14 @@ async def handle_text(message: Message):
         await wait_msg.edit_text(
             "Выберите качество загрузки:",
             reply_markup=build_quality_keyboard("youtube", token, size_hints),
+        )
+        return
+
+    if RUTUBE_RE.match(text):
+        token = _cache_url(text)
+        await message.answer(
+            "Выберите качество загрузки (Rutube):",
+            reply_markup=build_quality_keyboard("rutube", token),
         )
         return
 
