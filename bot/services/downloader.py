@@ -1,531 +1,355 @@
-import logging
+import asyncio
 import os
+import re
 import shutil
-import subprocess
-import sys
-import time
-import urllib.request
 import uuid
 from pathlib import Path
-from typing import Callable
 
-import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Message,
+)
 
-from bot.config import COOKIES_FILE, DOWNLOAD_DIR, IG_COOKIES_FILE, MAX_FILE_SIZE_MB
+from bot.config import DOWNLOAD_DIR
+from bot.services.downloader import (
+    MediaNotFoundError,
+    download_media,
+    get_video_size_hints,
+    search_audio,
+)
 
-logger = logging.getLogger(__name__)
+router = Router()
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+YOUTUBE_RE = re.compile(r"(https?://)?(www\.|m\.)?(youtube\.com|youtu\.be)/.+")
+RUTUBE_RE = re.compile(r"(https?://)?(www\.|m\.)?rutube\.ru/(video|shorts|yappy)/.+")
+INSTAGRAM_RE = re.compile(r"(https?://)?(www\.)?instagram\.com/(reel|p|tv)/.+")
+TIKTOK_RE = re.compile(r"(https?://)?(www\.|vm\.|vt\.|m\.)?tiktok\.com/.+")
+VK_CLIP_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/clip-?\d+_\d+.*")
+VK_VIDEO_RE = re.compile(r"(https?://)?(www\.|m\.)?(vk\.com|vk\.ru|vkvideo\.ru)/(video-?\d+_\d+|.*z=video-?\d+_\d+).*")
+TWITTER_RE = re.compile(r"(https?://)?(www\.|m\.|mobile\.)?(twitter\.com|x\.com)/.+")
 
-MAX_REASONABLE_VBR_BY_HEIGHT: dict[int, float] = {
-    360: 1800.0,
-    480: 3500.0,
-    720: 7000.0,
-    1080: 12000.0,
-}
+SHORT_VIDEO_MODES = {"instagram", "tiktok", "vk_clip", "twitter"}
 
-YT_CLIENTS = ["mweb", "web"]
-
-
-class MediaNotFoundError(Exception):
-    """Понятная ошибка для пользователя, когда медиа не найдено или недоступно."""
-
-
-def _build_bar(percent: float, length: int = 10) -> str:
-    filled = int(length * percent / 100)
-    return "█" * filled + "░" * (length - filled)
-
-
-def _format_size_human(num_bytes: int | float | None) -> str | None:
-    if not num_bytes or num_bytes <= 0:
-        return None
-    mb = num_bytes / (1024 * 1024)
-    if mb >= 1024:
-        return f"~{mb / 1024:.1f} ГБ"
-    if mb >= 100:
-        return f"~{mb:.0f} МБ"
-    return f"~{mb:.1f} МБ"
+# Временное хранилище ссылок (callback_data ограничена 64 байтами)
+URL_CACHE: dict[str, str] = {}
 
 
-def _estimate_format_bytes(
-    fmt: dict,
-    duration: float | None,
-    is_audio: bool = False,
-    target_height: int | None = None,
-) -> tuple[int | None, bool]:
-    """Возвращает (оценка_байт, признак_надёжности)."""
-    exact_size = fmt.get("filesize")
-    if exact_size and int(exact_size) > 0:
-        return int(exact_size), True
-
-    approx_size = fmt.get("filesize_approx")
-    if approx_size and int(approx_size) > 0:
-        est = int(approx_size)
-        if not is_audio and target_height and duration and float(duration) > 0:
-            max_vbr = MAX_REASONABLE_VBR_BY_HEIGHT.get(target_height, 15000.0)
-            max_sensible_bytes = int(max_vbr * 1000 / 8 * float(duration) * 1.5)
-            if est > max_sensible_bytes:
-                return None, False
-        return est, False
-
-    if duration and float(duration) > 0:
-        dur = float(duration)
-        if is_audio:
-            abr = fmt.get("abr")
-            if abr and 0 < float(abr) <= 320:
-                return int(float(abr) * 1000 / 8 * dur), False
-        else:
-            vbr = fmt.get("vbr")
-            cap = MAX_REASONABLE_VBR_BY_HEIGHT.get(target_height or 1080, 15000.0)
-            if vbr and 0 < float(vbr) <= cap:
-                return int(float(vbr) * 1000 / 8 * dur), False
-
-    return None, False
+def _cache_url(url: str) -> str:
+    token = uuid.uuid4().hex[:8]
+    if len(URL_CACHE) > 300:
+        URL_CACHE.pop(next(iter(URL_CACHE)))
+    URL_CACHE[token] = url
+    return token
 
 
-def _compute_hints_from_info(info: dict) -> dict[str, str]:
-    formats = info.get("formats") or []
-    duration = info.get("duration")
-    if not isinstance(formats, list) or not formats:
-        return {}
-
-    audio_items: list[tuple[int, int, bool]] = []
-    raw_video_formats: list[dict] = []
-
-    for fmt in formats:
-        if not isinstance(fmt, dict):
-            continue
-        vcodec = str(fmt.get("vcodec") or "none")
-        acodec = str(fmt.get("acodec") or "none")
-        ext = str(fmt.get("ext") or "")
-        height = int(fmt.get("height") or 0)
-
-        if vcodec == "none" and acodec != "none":
-            est_a, reliable_a = _estimate_format_bytes(fmt, duration, is_audio=True)
-            if est_a:
-                is_m4a = 1 if ext == "m4a" else 0
-                abr = int(float(fmt.get("abr") or 0))
-                audio_items.append((is_m4a * 10000 + abr, est_a, reliable_a))
-
-        if vcodec != "none" and height > 0:
-            raw_video_formats.append(fmt)
-
-    hints: dict[str, str] = {}
-
-    best_audio_bytes: int | None = None
-    best_audio_reliable = False
-    if audio_items:
-        _, best_audio_bytes, best_audio_reliable = max(audio_items, key=lambda item: item[0])
-        if duration and float(duration) > 0:
-            mp3_bytes = min(best_audio_bytes, int(float(duration) * 192 * 1000 / 8))
-        else:
-            mp3_bytes = best_audio_bytes
-        aud_str = _format_size_human(mp3_bytes)
-        if aud_str:
-            hints["audio"] = aud_str
-
-    prev_bytes: int | None = None
-    seen_video_sizes: set[str] = set()
-
-    for q in ("1080", "720", "480", "360"):
-        max_h = int(q)
-        candidates: list[tuple[int, int, int, float, int, bool, bool]] = []
-
-        for fmt in raw_video_formats:
-            h = int(fmt.get("height") or 0)
-            if h <= 0 or h > max_h:
-                continue
-            est_v, reliable_v = _estimate_format_bytes(
-                fmt,
-                duration,
-                is_audio=False,
-                target_height=max_h,
-            )
-            if not est_v:
-                continue
-            vcodec = str(fmt.get("vcodec") or "none")
-            acodec = str(fmt.get("acodec") or "none")
-            ext = str(fmt.get("ext") or "")
-            is_avc = 1 if vcodec.startswith("avc1") else 0
-            is_mp4 = 1 if ext == "mp4" else 0
-            has_aud = 1 if acodec != "none" else 0
-            br = float(fmt.get("vbr") or 0)
-            candidates.append((h, is_avc, is_mp4, br, est_v, bool(has_aud), reliable_v))
-
-        if not candidates:
-            continue
-
-        _, _, _, _, v_bytes, has_aud, reliable_v = max(
-            candidates,
-            key=lambda item: (item[0], item[1], item[2], item[3]),
-        )
-
-        need_audio = (not has_aud) and (best_audio_bytes is not None)
-        total_bytes = v_bytes + (best_audio_bytes if need_audio else 0)
-        is_reliable = reliable_v and (not need_audio or best_audio_reliable)
-
-        if not is_reliable:
-            continue
-        if prev_bytes is not None and total_bytes >= prev_bytes:
-            continue
-
-        prev_bytes = total_bytes
-        v_str = _format_size_human(total_bytes)
-        if v_str and v_str not in seen_video_sizes:
-            seen_video_sizes.add(v_str)
-            hints[q] = v_str
-
-    return hints
+def _format_duration(seconds: int | None) -> str:
+    if not seconds:
+        return ""
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f" ({hours}:{mins:02d}:{secs:02d})"
+    return f" ({mins}:{secs:02d})"
 
 
-def get_video_size_hints(url: str, mode: str = "youtube") -> dict[str, str]:
-    """Оценивает примерный размер для качеств 1080/720/480/360 и audio без скачивания файла."""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "source_address": "0.0.0.0",
-        "extractor_args": {
-            "youtube": {
-                "player_client": YT_CLIENTS,
-            }
-        },
-    }
-    if COOKIES_FILE:
-        opts["cookiefile"] = COOKIES_FILE
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False) or {}
-        if isinstance(info, dict) and "entries" in info and info["entries"]:
-            info = info["entries"][0] or {}
-        return _compute_hints_from_info(info)
-    except Exception as exc:
-        logger.debug("Failed to fetch size hints for %s: %s", url, exc)
-        return {}
+def _label_with_size(base_label: str, size_hint: str | None) -> str:
+    if not size_hint:
+        return base_label
+    return f"{base_label} ({size_hint})"
 
 
-def _guess_image_ext(url: str, content_type: str = "") -> str:
-    clean_url = url.split("?", maxsplit=1)[0].lower()
-    for ext in IMAGE_EXTS:
-        if clean_url.endswith(ext):
-            return ".jpg" if ext == ".jpeg" else ext
-    ct = content_type.lower()
-    if "png" in ct:
-        return ".png"
-    if "webp" in ct:
-        return ".webp"
-    return ".jpg"
-
-
-def _cookie_header_from_file(cookiefile: str | None) -> str | None:
-    """Собирает заголовок Cookie из Netscape cookies.txt для прямых запросов к CDN."""
-    if not cookiefile or not os.path.isfile(cookiefile):
-        return None
-    pairs: list[str] = []
-    try:
-        with open(cookiefile, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    name, value = parts[5], parts[6]
-                    if name:
-                        pairs.append(f"{name}={value}")
-    except Exception as exc:
-        logger.warning("Failed to parse cookies from %s: %s", cookiefile, exc)
-        return None
-    return "; ".join(pairs) if pairs else None
-
-
-def _download_image_file(
-    url: str,
-    dest_stem: str,
-    impersonate: bool = False,
-    cookiefile: str | None = None,
-) -> Path | None:
-    if not url or not url.startswith(("http://", "https://")):
-        return None
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-    cookie_hdr = _cookie_header_from_file(cookiefile)
-    if cookie_hdr:
-        headers["Cookie"] = cookie_hdr
-
-    try:
-        if impersonate:
-            from curl_cffi import requests as cffi_requests
-
-            resp = cffi_requests.get(
-                url,
-                headers=headers,
-                impersonate="chrome",
-                timeout=20,
-                allow_redirects=True,
-            )
-            if resp.status_code >= 400 or not resp.content:
-                return None
-            ext = _guess_image_ext(url, resp.headers.get("content-type", ""))
-            out_path = DOWNLOAD_DIR / f"{dest_stem}{ext}"
-            out_path.write_bytes(resp.content)
-            return out_path
-
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = resp.read()
-            if not data:
-                return None
-            ext = _guess_image_ext(url, resp.headers.get("content-type", ""))
-            out_path = DOWNLOAD_DIR / f"{dest_stem}{ext}"
-            out_path.write_bytes(data)
-            return out_path
-    except Exception as exc:
-        logger.debug("Failed to download image %s: %s", url, exc)
-        return None
-
-
-def _download_via_gallery_dl(url: str, file_id: str, cookiefile: str | None = None) -> list[str]:
-    """Скачивает фото/карусель через gallery-dl во временную папку и возвращает список путей."""
-    temp_dir = DOWNLOAD_DIR / f"{file_id}_gdl"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "gallery_dl",
-        "--no-mtime",
-        "-d",
-        str(temp_dir),
-    ]
-    if cookiefile and os.path.isfile(cookiefile):
-        cmd.extend(["--cookies", cookiefile])
-    cmd.append(url)
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if proc.returncode != 0:
-            logger.warning(
-                "gallery-dl exited with code %s for %s: %s",
-                proc.returncode,
-                url,
-                (proc.stderr or proc.stdout or "").strip(),
-            )
-    except Exception as exc:
-        logger.warning("gallery-dl failed for %s: %s", url, exc)
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return []
-
-    matched = sorted(
-        f for f in temp_dir.rglob("*")
-        if f.is_file() and f.stat().st_size > 0
+def build_quality_keyboard(
+    mode: str,
+    token: str,
+    size_hints: dict[str, str] | None = None,
+) -> InlineKeyboardMarkup:
+    hints = size_hints or {}
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 1080p", hints.get("1080")),
+                    callback_data=f"q:{mode}:{token}:1080",
+                ),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 720p", hints.get("720")),
+                    callback_data=f"q:{mode}:{token}:720",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 480p", hints.get("480")),
+                    callback_data=f"q:{mode}:{token}:480",
+                ),
+                InlineKeyboardButton(
+                    text=_label_with_size("🎬 360p", hints.get("360")),
+                    callback_data=f"q:{mode}:{token}:360",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=_label_with_size("🎵 Только аудио (MP3)", hints.get("audio")),
+                    callback_data=f"q:{mode}:{token}:audio",
+                ),
+            ],
+        ]
     )
-    if not matched:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return []
-
-    return [str(p) for p in matched[:10]]
 
 
-def search_audio(query: str, limit: int = 5) -> list[dict]:
-    """Быстро ищет треки на YouTube без скачивания и возвращает список словарей."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "source_address": "0.0.0.0",
-    }
-    if COOKIES_FILE:
-        ydl_opts["cookiefile"] = COOKIES_FILE
+def build_audio_search_keyboard(tracks: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for track in tracks:
+        token = _cache_url(track["url"])
+        dur = _format_duration(track.get("duration"))
+        title = track["title"]
+        if len(title) > 45:
+            title = title[:42] + "..."
+        rows.append([
+            InlineKeyboardButton(text=f"🎵 {title}{dur}", callback_data=f"aud:{token}")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
 
-    results = []
-    for entry in info.get("entries") or []:
-        url = entry.get("url")
-        if not url:
+async def _safe_edit(msg: Message, text: str):
+    try:
+        await msg.edit_text(text)
+    except TelegramBadRequest:
+        pass
+
+
+def _cleanup_paths(
+    file_path: str | None,
+    thumb_path: str | None,
+    photo_paths: list[str],
+) -> None:
+    """Удаляет скачанные файлы, превью и временные директории после отправки."""
+    base_dir = Path(DOWNLOAD_DIR).resolve()
+    dirs_to_remove: set[Path] = set()
+    files_to_remove: set[Path] = set()
+
+    for raw in (file_path, thumb_path, *photo_paths):
+        if not raw:
             continue
-        if not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={url}"
-        results.append({
-            "title": entry.get("title") or "Без названия",
-            "url": url,
-            "duration": int(entry["duration"]) if entry.get("duration") else None,
-        })
-    return results
+        p = Path(raw).resolve()
+        try:
+            p.relative_to(base_dir)
+        except ValueError:
+            continue
+
+        if p.parent != base_dir and "_gdl" in p.parent.name:
+            dirs_to_remove.add(p.parent)
+        else:
+            files_to_remove.add(p)
+            stem = p.stem.split(".", maxsplit=1)[0]
+            if stem and p.parent == base_dir:
+                for sibling in base_dir.glob(f"{stem}*"):
+                    if sibling.is_file():
+                        files_to_remove.add(sibling)
+                    elif sibling.is_dir() and "_gdl" in sibling.name:
+                        dirs_to_remove.add(sibling)
+
+    for file_item in files_to_remove:
+        try:
+            file_item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    for dir_item in dirs_to_remove:
+        try:
+            shutil.rmtree(dir_item, ignore_errors=True)
+        except OSError:
+            pass
 
 
-def download_media(
+async def _download_and_send(
+    target_msg: Message,
+    status_msg: Message,
     query: str,
     mode: str,
     quality: str = "1080",
-    progress_callback: Callable[[str], None] | None = None,
-) -> dict:
-    """Синхронно скачивает видео, фото/карусель или аудио и возвращает словарь с путями."""
-    file_id = uuid.uuid4().hex
-    outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
-    last_update = 0.0
-    use_impersonate = mode in ("instagram", "tiktok")
-    active_cookies = IG_COOKIES_FILE if mode == "instagram" else COOKIES_FILE
+    header: str = "Скачиваю...",
+):
+    file_path: str | None = None
+    thumb_path: str | None = None
+    photo_paths: list[str] = []
+    loop = asyncio.get_running_loop()
 
-    def progress_hook(d: dict):
-        nonlocal last_update
-        if not progress_callback:
-            return
-
-        status = d.get("status")
-        now = time.monotonic()
-
-        if status == "downloading":
-            if now - last_update < 2.0:
-                return
-            last_update = now
-
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes") or 0
-            speed = d.get("speed") or 0
-            speed_mb = speed / (1024 * 1024)
-
-            if total > 0:
-                pct = min(100.0, downloaded * 100 / total)
-                bar = _build_bar(pct)
-                progress_callback(f"[{bar}] {pct:.0f}% • {speed_mb:.1f} МБ/с")
-            else:
-                dl_mb = downloaded / (1024 * 1024)
-                progress_callback(f"Скачано {dl_mb:.1f} МБ • {speed_mb:.1f} МБ/с")
-
-        elif status == "finished":
-            last_update = now
-            progress_callback("Обработка и склейка файла...")
-
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        "source_address": "0.0.0.0",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "writethumbnail": True,
-        "max_filesize": MAX_FILE_SIZE_MB * 1024 * 1024,
-        "progress_hooks": [progress_hook],
-        "extractor_args": {
-            "youtube": {
-                "player_client": YT_CLIENTS,
-            }
-        },
-        "postprocessors": [
-            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
-        ],
-    }
-
-    if active_cookies:
-        ydl_opts["cookiefile"] = active_cookies
-
-    if mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio"):
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"].insert(0, {
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        })
-        if mode == "music" and not query.startswith("http"):
-            ydl_opts["default_search"] = "ytsearch1"
-    elif mode in ("youtube", "vk_video"):
-        ydl_opts.update({
-            "format": (
-                f"bestvideo[height<={quality}][vcodec^=avc1]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={quality}]+bestaudio/"
-                f"best[height<={quality}]/best"
-            ),
-            "merge_output_format": "mp4",
-        })
-    elif mode in ("instagram", "tiktok", "vk_clip", "twitter"):
-        ydl_opts.update({
-            "format": "best[ext=mp4]/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-            "merge_output_format": "mp4",
-        })
-        if use_impersonate:
-            ydl_opts["impersonate"] = ImpersonateTarget("chrome")
-
-    info: dict = {}
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            extracted = ydl.extract_info(query, download=True)
-            info = (
-                extracted["entries"][0]
-                if isinstance(extracted, dict) and "entries" in extracted and extracted["entries"]
-                else (extracted or {})
-            )
-    except yt_dlp.utils.DownloadError as err:
-        msg = str(err)
-        logger.warning("yt-dlp DownloadError for %s (mode=%s): %s", query, mode, msg)
-
-        if mode in ("instagram", "twitter") and ("No video formats found" in msg or "gallery" in msg.lower()):
-            photos = _download_via_gallery_dl(query, file_id, cookiefile=active_cookies)
-            if photos:
-                return {
-                    "type": "photos",
-                    "paths": photos,
-                    "title": "Фото",
-                }
-            raise MediaNotFoundError(
-                "Не удалось получить медиа по этой ссылке — возможно, пост недоступен или ссылка неверная."
-            ) from err
-
-        if any(k in msg for k in ("HTTP Error 404", "Not Found", "Private video", "unavailable")):
-            raise MediaNotFoundError(
-                "Файл не найден по этой ссылке — возможно, ссылка неверная или доступ к публикации ограничен."
-            ) from err
-
-        raise MediaNotFoundError(
-            "Не удалось скачать файл по этой ссылке. Проверьте ссылку или попробуйте позже."
-        ) from err
-
-    all_files = list(DOWNLOAD_DIR.glob(f"{file_id}.*"))
-    media_files = [f for f in all_files if f.suffix.lower() not in IMAGE_EXTS]
-    thumb_files = [f for f in all_files if f.suffix.lower() == ".jpg"]
-
-    if not media_files and mode in ("instagram", "twitter"):
-        for f in thumb_files:
-            f.unlink(missing_ok=True)
-        photos = _download_via_gallery_dl(query, file_id, cookiefile=active_cookies)
-        if photos:
-            return {
-                "type": "photos",
-                "paths": photos,
-                "title": info.get("title") or "Фото",
-            }
-
-    if not media_files:
-        for f in all_files:
-            f.unlink(missing_ok=True)
-        raise MediaNotFoundError(
-            f"Файл не найден по этой ссылке (возможно, ссылка неверная или превышен лимит {MAX_FILE_SIZE_MB} МБ)."
+    def on_progress(progress_text: str):
+        asyncio.run_coroutine_threadsafe(
+            _safe_edit(status_msg, f"{header}\n{progress_text}"),
+            loop,
         )
 
-    actual_height = info.get("height")
-    logger.info(
-        "Downloaded media mode=%s requested_q=%s actual=%sx%s title=%s",
-        mode,
-        quality,
-        info.get("width"),
-        actual_height,
-        info.get("title"),
+    try:
+        meta = await asyncio.to_thread(download_media, query, mode, quality, on_progress)
+        media_type = meta.get("type", "video")
+        title = meta["title"]
+
+        await _safe_edit(status_msg, f"{header}\nОтправляю в Telegram...")
+
+        if media_type == "photos":
+            photo_paths = meta.get("paths") or []
+            if len(photo_paths) == 1:
+                await target_msg.answer_photo(photo=FSInputFile(photo_paths[0]))
+            elif photo_paths:
+                group = [InputMediaPhoto(media=FSInputFile(p)) for p in photo_paths[:10]]
+                await target_msg.answer_media_group(media=group)
+        else:
+            file_path = meta.get("path")
+            thumb_path = meta.get("thumb")
+            if not file_path:
+                raise MediaNotFoundError("Файл не найден после загрузки.")
+            safe_name = f"{title[:50]}{Path(file_path).suffix}"
+            media = FSInputFile(file_path, filename=safe_name)
+            thumb = FSInputFile(thumb_path) if thumb_path and os.path.exists(thumb_path) else None
+
+            if media_type == "audio":
+                await target_msg.answer_audio(
+                    audio=media,
+                    title=title,
+                    duration=meta.get("duration"),
+                    thumbnail=thumb,
+                )
+            else:
+                await target_msg.answer_video(
+                    video=media,
+                    caption=None if mode in SHORT_VIDEO_MODES else title[:200],
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    duration=meta.get("duration"),
+                    thumbnail=thumb,
+                    supports_streaming=True,
+                )
+
+        await status_msg.delete()
+
+    except MediaNotFoundError as e:
+        await _safe_edit(
+            status_msg,
+            f"⚠️ Медиа не найдено\n{e}",
+        )
+    except Exception:
+        await _safe_edit(
+            status_msg,
+            "⚠️ Не удалось загрузить файл\nСсылка неверная, файл не найден или сервис временно недоступен.",
+        )
+
+    finally:
+        _cleanup_paths(file_path, thumb_path, photo_paths)
+
+
+@router.message(F.text)
+async def handle_text(message: Message):
+    text = message.text.strip()
+
+    if YOUTUBE_RE.match(text):
+        token = _cache_url(text)
+        wait_msg = await message.answer("Проверяю доступные качества и размер...")
+        size_hints = await asyncio.to_thread(get_video_size_hints, text, "youtube")
+        await wait_msg.edit_text(
+            "Выберите качество загрузки:",
+            reply_markup=build_quality_keyboard("youtube", token, size_hints),
+        )
+        return
+
+    if RUTUBE_RE.match(text):
+        token = _cache_url(text)
+        await message.answer(
+            "Выберите качество загрузки (Rutube):",
+            reply_markup=build_quality_keyboard("rutube", token),
+        )
+        return
+
+    if VK_VIDEO_RE.match(text):
+        token = _cache_url(text)
+        await message.answer(
+            "Выберите качество загрузки (VK Видео):",
+            reply_markup=build_quality_keyboard("vk_video", token),
+        )
+        return
+
+    if INSTAGRAM_RE.match(text):
+        header = "Скачиваю из Instagram..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "instagram", header=header)
+        return
+
+    if TIKTOK_RE.match(text):
+        header = "Скачиваю из TikTok..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "tiktok", header=header)
+        return
+
+    if VK_CLIP_RE.match(text):
+        header = "Скачиваю VK Клип..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "vk_clip", header=header)
+        return
+
+    if TWITTER_RE.match(text):
+        header = "Скачиваю из Twitter (X)..."
+        status_msg = await message.answer(header)
+        await _download_and_send(message, status_msg, text, "twitter", header=header)
+        return
+
+    # Поиск музыки с выбором трека
+    status_msg = await message.answer(f"Ищу треки по запросу «{text}»...")
+    try:
+        tracks = await asyncio.to_thread(search_audio, text, 5)
+    except Exception:
+        await _safe_edit(status_msg, "⚠️ Не удалось выполнить поиск. Попробуйте позже.")
+        return
+
+    if not tracks:
+        await _safe_edit(status_msg, f"По запросу «{text}» ничего не найдено.")
+        return
+
+    await status_msg.edit_text(
+        f"Результаты по запросу «{text}»:\nВыберите трек для скачивания:",
+        reply_markup=build_audio_search_keyboard(tracks),
     )
 
-    is_audio = mode == "music" or (mode in ("youtube", "vk_video") and quality == "audio")
-    return {
-        "type": "audio" if is_audio else "video",
-        "path": str(media_files[0]),
-        "thumb": str(thumb_files[0]) if thumb_files else None,
-        "title": info.get("title", "media"),
-        "width": info.get("width"),
-        "height": actual_height,
-        "duration": int(info["duration"]) if info.get("duration") else None,
-    }
+
+@router.callback_query(F.data.startswith("q:"))
+async def handle_video_quality(callback: CallbackQuery):
+    await callback.answer()
+
+    _, mode, token, quality = callback.data.split(":", maxsplit=3)
+    url = URL_CACHE.get(token)
+
+    if not url:
+        await callback.message.edit_text("Ссылка устарела, отправьте её заново.")
+        return
+
+    label = "аудио (MP3)" if quality == "audio" else f"видео ({quality}p)"
+    header = f"Скачиваю {label}..."
+    await callback.message.edit_text(header, reply_markup=None)
+
+    await _download_and_send(
+        callback.message, callback.message, url, mode, quality, header=header
+    )
+
+
+@router.callback_query(F.data.startswith("aud:"))
+async def handle_audio_select(callback: CallbackQuery):
+    await callback.answer()
+
+    _, token = callback.data.split(":", maxsplit=1)
+    url = URL_CACHE.get(token)
+
+    if not url:
+        await callback.message.edit_text("Список устарел, отправьте запрос заново.")
+        return
+
+    header = "Скачиваю трек (MP3)..."
+    await callback.message.edit_text(header, reply_markup=None)
+
+    await _download_and_send(
+        callback.message, callback.message, url, "youtube", "audio", header=header
+    )
